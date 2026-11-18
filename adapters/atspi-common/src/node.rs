@@ -9,8 +9,8 @@
 // found in the LICENSE.chromium file.
 
 use accesskit::{
-    Action, ActionData, ActionRequest, Affine, Live, NodeId, Orientation, Point, Rect, Role,
-    Toggled, TreeId,
+    Action, ActionData, ActionRequest, Affine, AriaCurrent, Live, NodeId, Orientation, Point, Rect,
+    Role, Toggled, TreeId,
 };
 use accesskit_consumer::{FilterResult, FullNodeId, NodeRef, Tree, TreeState};
 use atspi_common::{
@@ -342,6 +342,11 @@ impl NodeWrapper<'_> {
         if state.is_modal() {
             atspi_state.insert(State::Modal);
         }
+        // Core-AAM maps a non-false aria-current to the active state, and Orca only
+        // reads the "current" attribute when this state is set.
+        if self.current().is_some() {
+            atspi_state.insert(State::Active);
+        }
         if let Some(selected) = state.is_selected() {
             if !state.is_disabled() {
                 atspi_state.insert(State::Selectable);
@@ -414,6 +419,18 @@ impl NodeWrapper<'_> {
         self.0.braille_role_description()
     }
 
+    fn current(&self) -> Option<&'static str> {
+        match self.0.aria_current()? {
+            AriaCurrent::False => None,
+            AriaCurrent::True => Some("true"),
+            AriaCurrent::Page => Some("page"),
+            AriaCurrent::Step => Some("step"),
+            AriaCurrent::Location => Some("location"),
+            AriaCurrent::Date => Some("date"),
+            AriaCurrent::Time => Some("time"),
+        }
+    }
+
     fn attributes(&self) -> HashMap<&'static str, String> {
         let mut attributes = HashMap::new();
         if let Some(placeholder) = self.placeholder() {
@@ -433,6 +450,9 @@ impl NodeWrapper<'_> {
         }
         if let Some(role_description) = self.braille_role_description() {
             attributes.insert("brailleroledescription", role_description.to_string());
+        }
+        if let Some(current) = self.current() {
+            attributes.insert("current", current.to_string());
         }
 
         attributes
@@ -2062,4 +2082,141 @@ pub struct CacheNode {
     pub description: String,
     pub role: AtspiRole,
     pub states: StateSet,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Adapter, AdapterCallback, AppContext, Event, NodeIdOrRoot, ObjectEvent, WindowBounds,
+    };
+    use accesskit::{
+        ActionHandler, ActionRequest, AriaCurrent, Node, NodeId, Role, TreeId, TreeInfo, TreeUpdate,
+    };
+    use accesskit_consumer::FullNodeId;
+    use atspi_common::{InterfaceSet, State};
+    use std::sync::{Arc, Mutex};
+
+    struct NoOpActionHandler;
+    impl ActionHandler for NoOpActionHandler {
+        fn do_action(&mut self, _request: ActionRequest) {}
+    }
+
+    struct StateChangeCallback {
+        changes: Arc<Mutex<Vec<(NodeIdOrRoot, State, bool)>>>,
+    }
+
+    impl AdapterCallback for StateChangeCallback {
+        fn register_interfaces(&self, _: &Adapter, _: FullNodeId, _: InterfaceSet) {}
+        fn unregister_interfaces(&self, _: &Adapter, _: FullNodeId, _: InterfaceSet) {}
+        fn emit_event(&self, _: &Adapter, event: Event) {
+            if let Event::Object {
+                target,
+                event: ObjectEvent::StateChanged(state, value),
+            } = event
+            {
+                self.changes.lock().unwrap().push((target, state, value));
+            }
+        }
+    }
+
+    fn tree(button: Node) -> TreeUpdate {
+        let mut window = Node::new(Role::Window);
+        window.set_children(vec![NodeId(1)]);
+        TreeUpdate {
+            nodes: vec![(NodeId(0), window), (NodeId(1), button)],
+            tree: Some(TreeInfo::new(NodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus: NodeId(0),
+        }
+    }
+
+    fn button(current: Option<AriaCurrent>) -> Node {
+        let mut node = Node::new(Role::Button);
+        if let Some(current) = current {
+            node.set_aria_current(current);
+        }
+        node
+    }
+
+    type Changes = Arc<Mutex<Vec<(NodeIdOrRoot, State, bool)>>>;
+
+    fn build(current: Option<AriaCurrent>) -> (Adapter, FullNodeId, Changes) {
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let app_context = AppContext::new(None);
+        let adapter = Adapter::new(
+            &app_context,
+            StateChangeCallback {
+                changes: changes.clone(),
+            },
+            tree(button(current)),
+            false,
+            WindowBounds::default(),
+            NoOpActionHandler,
+        );
+        let button_id = adapter
+            .platform_node(adapter.root_id())
+            .child_at_index(0)
+            .unwrap()
+            .unwrap();
+        (adapter, button_id, changes)
+    }
+
+    #[test]
+    fn current_is_exposed_as_attribute_and_active_state() {
+        for (current, value) in [
+            (AriaCurrent::True, "true"),
+            (AriaCurrent::Page, "page"),
+            (AriaCurrent::Step, "step"),
+            (AriaCurrent::Location, "location"),
+            (AriaCurrent::Date, "date"),
+            (AriaCurrent::Time, "time"),
+        ] {
+            let (adapter, button_id, _) = build(Some(current));
+            let node = adapter.platform_node(button_id);
+            let attributes = node.attributes().unwrap();
+            assert_eq!(attributes.get("current").map(String::as_str), Some(value));
+            assert!(node.state().contains(State::Active));
+        }
+    }
+
+    #[test]
+    fn false_or_unset_current_is_not_exposed() {
+        for current in [None, Some(AriaCurrent::False)] {
+            let (adapter, button_id, _) = build(current);
+            let node = adapter.platform_node(button_id);
+            assert!(!node.attributes().unwrap().contains_key("current"));
+            assert!(!node.state().contains(State::Active));
+        }
+    }
+
+    #[test]
+    fn changing_current_emits_active_state_change() {
+        let (mut adapter, button_id, changes) = build(None);
+        let target = NodeIdOrRoot::Node(button_id);
+
+        adapter.update(TreeUpdate {
+            nodes: vec![(NodeId(1), button(Some(AriaCurrent::Page)))],
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: NodeId(0),
+        });
+        assert_eq!(*changes.lock().unwrap(), [(target, State::Active, true)]);
+
+        changes.lock().unwrap().clear();
+        adapter.update(TreeUpdate {
+            nodes: vec![(NodeId(1), button(Some(AriaCurrent::Step)))],
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: NodeId(0),
+        });
+        assert!(changes.lock().unwrap().is_empty());
+
+        adapter.update(TreeUpdate {
+            nodes: vec![(NodeId(1), button(Some(AriaCurrent::False)))],
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: NodeId(0),
+        });
+        assert_eq!(*changes.lock().unwrap(), [(target, State::Active, false)]);
+    }
 }
